@@ -1,10 +1,11 @@
-# Cities News Scrapper 🏙️📰
+# Cities News Scrapper v2.0 🏙️📰
 
-Coletor automatizado de notícias hiper-locais para 100+ cidades brasileiras, usando Google News RSS. Projetado para alimentar a IA interna da 99 com dados brutos estruturados sobre eventos que impactam a operação de mobilidade.
+Coletor profissional de notícias hiper-locais para 100+ cidades brasileiras, usando Google News RSS.
+Projetado para alimentar a IA interna da **99** com dados limpos e operacionalmente relevantes sobre eventos que impactam a mobilidade urbana.
 
 ## Pré-requisitos
 
-- Python 3.x
+- Python 3.10+
 - pip
 
 ## Instalação
@@ -24,7 +25,6 @@ Edite o arquivo `cidades.json` com suas cidades:
   "São Paulo",
   "Rio de Janeiro",
   "Belo Horizonte",
-  "Porto Alegre",
   "..."
 ]
 ```
@@ -36,10 +36,10 @@ Edite `config.py` para ajustar:
 | Parâmetro | Padrão | Descrição |
 |-----------|--------|-----------|
 | `SEARCH_PERIOD_DAYS` | `7` | Janela temporal de busca (dias) |
-| `BASE_DELAY` | `1.0` | Delay inicial entre requisições (segundos) |
+| `BASE_DELAY` | `1.5` | Delay entre requisições (segundos) |
 | `MAX_DELAY` | `10.0` | Delay máximo em caso de bloqueio |
-| `BACKOFF_FACTOR` | `2.0` | Multiplicador de backoff |
-| `SEARCH_QUERIES` | *ver arquivo* | Matriz de palavras-chave por categoria |
+| `ENABLE_GLOBAL_DEDUP` | `True` | Deduplicação global por título |
+| `SEARCH_QUERIES` | *ver arquivo* | Termos de busca por categoria |
 
 ## Execução
 
@@ -49,31 +49,82 @@ python scrapper.py
 
 O relatório será salvo em: `output/relatorio_YYYY-MM-DD.csv`
 
-## Formato de Saída (CSV)
+## Pipeline de Filtros (4 Camadas)
 
-O arquivo de saída é gerado com vírgula (`,`) como delimitador e codificação `UTF-8-SIG` para compatibilidade total com ferramentas de IA e análise de dados.
+Cada notícia coletada passa por **4 filtros em sequência**. Se falhar em qualquer um, é descartada:
 
-As colunas do arquivo CSV são:
-
-1. `cidade`: Nome da cidade pesquisada.
-2. `categoria`: Categoria operacional (Concorrência, Clima, Legislação, Eventos).
-3. `query_termo`: Palavra-chave específica que deu match na notícia.
-4. `titulo`: Título da matéria de notícias.
-5. `link`: Link original da matéria.
-6. `resumo_google`: Resumo gerado pelo Google News (limpo de tags HTML).
-7. `data_publicacao`: Data e hora da publicação em formato ISO 8601.
-
-Exemplo de linhas do CSV:
-```csv
-cidade,categoria,query_termo,titulo,link,resumo_google,data_publicacao
-Porto Alegre,Eventos,greve transporte,Sindicato anuncia greve de ônibus,https://...,Motoristas ameaçam paralisar linhas...,2026-06-28T14:30:00+00:00
-Porto Alegre,Concorrência,inDrive,InDrive lança nova categoria,https://...,Campanha agressiva da concorrente...,2026-06-27T09:15:00+00:00
+```
+Notícia bruta do Google News
+    │
+    ▼
+┌─────────────────────────┐
+│ 1. BLACKLIST             │  Crime, fofoca, celebridade, política partidária?
+│    → Descartada           │  
+└─────────────────────────┘
+    │ Passou
+    ▼
+┌─────────────────────────┐
+│ 2. LOCALIDADE            │  Notícia de outro país (Portugal, Nigéria, etc.)?
+│    → Descartada           │
+└─────────────────────────┘
+    │ Passou
+    ▼
+┌─────────────────────────┐
+│ 3. RELEVÂNCIA            │  Contém keywords operacionais da categoria?
+│    → Descartada           │
+└─────────────────────────┘
+    │ Passou
+    ▼
+┌─────────────────────────┐
+│ 4. DEDUPLICAÇÃO GLOBAL   │  Mesmo título já apareceu em outra cidade?
+│    → Descartada           │
+└─────────────────────────┘
+    │ Passou
+    ▼
+  ✅ ACEITA no CSV final
 ```
 
-## Categorias de Busca Ativas
+## Formato de Saída (CSV)
 
-- **Concorrência**: Uber, inDrive, aplicativo de transporte, aplicativo de corrida, motorista de aplicativo
-- **Clima**: chuva, alagamento, temporal, enchente
-- **Legislação**: regulamentação transporte aplicativo, lei motorista aplicativo, decreto transporte, tarifa aplicativo, regulamentação autônomo, locadora veículos regulamentação
-- **Eventos**: show, festival, evento, vestibular, concurso público, jogo futebol, feriado municipal, greve transporte
+Arquivo com vírgula (`,`) como delimitador e codificação `UTF-8-SIG`.
 
+| Coluna | Descrição |
+|--------|-----------|
+| `cidade` | Cidade pesquisada |
+| `categoria` | Categoria operacional |
+| `query_termo` | Palavra-chave que deu match |
+| `titulo` | Título limpo (sem nome do portal) |
+| `fonte` | Nome do portal/veículo |
+| `link` | Link original |
+| `resumo_google` | Resumo do Google News |
+| `data_publicacao` | Data ISO 8601 |
+
+## Categorias de Busca
+
+| Categoria | Foco | Fonte |
+|-----------|------|-------|
+| **Concorrência** | Uber, inDrive, apps locais | Google News |
+| **Legislação & Regulação** | Leis de transporte por app, locadoras | Google News |
+| **Clima Severo** | Alagamentos, enchentes, deslizamentos | Google News |
+| **Eventos de Grande Porte** | Shows lotados, vestibulares, greves | Google News |
+| **Governo (fonte oficial)** | Decretos e regulamentações | `site:gov.br` / `site:leg.br` |
+
+## Exemplo de Log de Execução
+
+```
+🏙️  [1/100] São Paulo
+    📰 Concorrência: 3 aceita(s) | 5 filtrada(s)
+    📰 Legislação & Regulação: 1 aceita(s)
+    📰 Clima Severo: 2 aceita(s) | 1 filtrada(s)
+    ✅ Total: 6 notícia(s) relevante(s)
+
+📊 RESUMO DA COLETA v2.0
+  🏙️  Cidades processadas:    100
+  ✅ Cidades com notícias:    67
+  📰 Notícias ACEITAS:        234
+  🚫 Total filtradas:         1847
+      ├─ Blacklist (crime):   312
+      ├─ Estrangeiras:        89
+      ├─ Irrelevantes:        1204
+      └─ Duplicadas (global): 242
+```

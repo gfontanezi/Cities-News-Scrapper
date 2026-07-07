@@ -1,120 +1,160 @@
 # ============================================================
 # config.py — Configurações centralizadas do Cities News Scrapper
+# Versão 2.0 — Filtros Profissionais
 # ============================================================
 
 # --- Filtro Temporal ---
-# Quantidade de dias para buscar notícias (7 = última semana)
 SEARCH_PERIOD_DAYS = 7
 
 # --- Rate Limiting / Delay Adaptativo ---
-# Delay inicial entre requisições (em segundos)
-BASE_DELAY = 1.0
-
-# Delay máximo (teto do backoff)
+BASE_DELAY = 1.5
 MAX_DELAY = 10.0
-
-# Fator de multiplicação quando ocorre falha/bloqueio
 BACKOFF_FACTOR = 2.0
-
-# Fator de redução quando volta a ter sucesso (diminui o delay gradualmente)
 RECOVERY_FACTOR = 0.8
 
 # --- Caminhos ---
-# Arquivo com a lista de cidades
 CITIES_FILE = "cidades.json"
-
-# Diretório e extensão de saída dos relatórios (formato CSV para a IA corporativa)
 OUTPUT_DIR = "output"
 
 # --- Google News RSS ---
-# Template da URL do Google News RSS
-# {query} = termo de busca URL-encoded
-# {when} = filtro temporal (ex: "7d" para 7 dias)
-# hl=pt-BR e gl=BR garantem resultados em português do Brasil
 GOOGLE_NEWS_RSS_URL = (
     "https://news.google.com/rss/search?"
     "q={query}+when:{when}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
 )
 
-# --- Matriz de Palavras-Chave ---
-# Cada categoria contém uma lista de termos de busca.
-# O script irá agrupar os termos de cada categoria em uma única busca usando
-# o operador OR, reduzindo o número total de requisições ao Google News.
-# Para cada cidade e categoria, a query será: "NomeCidade" (Termo1 OR Termo2 OR ...)
-#
-# Categorias focadas no que realmente impacta a operação de mobilidade:
-#   - Concorrência: apps grandes + termos genéricos que capturam apps locais/regionais
-#   - Clima: eventos climáticos que travam a cidade
-#   - Legislação: apenas regulação de transporte/mobilidade/aplicativos (não crime)
-#   - Eventos: shows, provas, jogos e qualquer evento que gere pico de demanda
+# ============================================================
+# QUERIES DE BUSCA
+# ============================================================
+# Cada categoria agrupa termos com OR para minimizar requisições.
+# Foco cirúrgico: apenas o que gera insight operacional para a 99.
 SEARCH_QUERIES = {
     "Concorrência": [
         "Uber",
         "inDrive",
         "aplicativo de transporte",
-        "aplicativo de corrida",
         "motorista de aplicativo",
     ],
-    "Clima": [
-        "chuva",
-        "alagamento",
-        "temporal",
-        "enchente",
-    ],
-    "Legislação": [
-        "regulamentação transporte aplicativo",
+    "Legislação & Regulação": [
+        "regulamentação aplicativo transporte",
         "lei motorista aplicativo",
-        "decreto transporte",
-        "tarifa aplicativo",
-        "regulamentação autônomo",
-        "locadora veículos regulamentação",
+        "decreto transporte aplicativo",
+        "tarifa aplicativo transporte",
+        "regulamentação locadora veículos",
     ],
-    "Eventos": [
-        "show",
-        "festival",
-        "evento",
+    "Clima Severo": [
+        "alagamento",
+        "enchente",
+        "temporal interdição",
+        "deslizamento",
+    ],
+    "Eventos de Grande Porte": [
+        "show lotado",
+        "festival ingressos",
         "vestibular",
-        "concurso público",
-        "jogo futebol",
-        "feriado municipal",
-        "greve transporte",
+        "greve ônibus",
+        "paralisação transporte",
+    ],
+    "Governo (fonte oficial)": [
+        "aplicativo transporte site:gov.br",
+        "motorista aplicativo site:gov.br",
+        "regulamentação aplicativo site:leg.br",
+        "decreto transporte site:gov.br",
     ],
 }
 
-# --- Filtro de Relevância ---
-# Após coletar uma notícia, o título e resumo devem conter ao menos
-# UMA dessas palavras para ser considerada relevante.
-# Isso elimina notícias genéricas que o Google News retorna por
-# proximidade geográfica mas sem relação com mobilidade/operação.
-# (A busca é case-insensitive)
+# ============================================================
+# FILTRO DE RELEVÂNCIA (whitelist pós-coleta)
+# ============================================================
+# Para cada categoria, a notícia DEVE conter ao menos UMA dessas
+# palavras no título+resumo para ser aceita. Case-insensitive.
 RELEVANCE_KEYWORDS = {
     "Concorrência": [
-        "uber", "indrive", "in drive", "99", "99app",
-        "aplicativo", "app", "corrida", "motorista",
-        "passageiro", "viagem", "tarifa", "desconto",
-        "promoção", "concorrente", "concorrência",
-        "plataforma", "mobilidade",
+        "uber", "indrive", "99", "99app", "aplicativo",
+        "motorista de app", "corrida", "tarifa", "desconto",
+        "concorrente", "mobilidade", "passageiro",
     ],
-    "Clima": [
-        "chuva", "alagamento", "temporal", "enchente",
-        "inundação", "tempestade", "vendaval", "granizo",
-        "ciclone", "tromba", "dilúvio", "nível do rio",
-        "deslizamento", "alerta", "defesa civil",
+    "Legislação & Regulação": [
+        "regulamentação", "regulação", "projeto de lei", "decreto",
+        "câmara", "prefeitura", "sanção", "alvará", "licença",
+        "aplicativo", "locadora", "transporte por aplicativo",
     ],
-    "Legislação": [
-        "regulamentação", "regulação", "lei", "decreto",
-        "tarifa", "legislação", "autônomo", "locadora",
-        "aplicativo", "transporte", "motorista", "plataforma",
-        "vereador", "câmara", "prefeitura", "projeto de lei",
-        "sanção", "veículo", "cnh", "alvará", "licença",
+    "Clima Severo": [
+        "alagamento", "enchente", "temporal", "interdição",
+        "deslizamento", "defesa civil", "bloqueio", "inundação",
     ],
-    "Eventos": [
-        "show", "festival", "evento", "vestibular", "enem",
-        "concurso", "prova", "jogo", "futebol", "partida",
-        "feriado", "greve", "paralisação", "manifestação",
-        "carnaval", "réveillon", "festa", "congresso", "feira",
-        "exposição", "arena", "estádio", "ingresso", "público",
-        "milhares", "multidão",
+    "Eventos de Grande Porte": [
+        "show", "festival", "vestibular", "enem", "greve",
+        "paralisação", "manifestação", "arena", "estádio",
+        "ingresso", "lotado", "esgotado",
+    ],
+    "Governo (fonte oficial)": [
+        "aplicativo", "transporte", "motorista", "decreto",
+        "regulamentação", "projeto de lei", "sanção", "tarifa",
+        "prefeitura", "câmara", "locadora",
     ],
 }
 
+# ============================================================
+# BLACKLIST — Descarte automático de ruídos
+# ============================================================
+# Se o título+resumo contiver QUALQUER uma dessas palavras,
+# a notícia é descartada IMEDIATAMENTE, mesmo que tenha keywords
+# relevantes. Ordem: blacklist roda ANTES do filtro de relevância.
+BLACKLIST_KEYWORDS = [
+    # --- Crimes e Violência ---
+    "assassinato", "homicídio", "morte", "morre", "morreu", "faleceu",
+    "tiroteio", "tiros", "tráfico", "polícia", "policial",
+    "prisão", "preso", "presa", "delegacia", "delegado",
+    "crime", "criminoso", "roubo", "furto", "assalto",
+    "estupro", "violência", "vítima", "suspeito", "flagrante",
+    "esfaqueado", "cadáver", "corpo encontrado",
+    "sequestro", "feminicídio", "latrocínio",
+    # --- Fofocas e Celebridades ---
+    "fofoca", "famoso", "famosa", "celebridade",
+    "atriz", "ator", "cantor", "cantora",
+    "namoro", "separação", "casamento",
+    "filha de", "filho de", "ex-marido", "ex-mulher",
+    "novela", "bbb", "reality", "big brother",
+    # --- Política Partidária (não regulatória) ---
+    "impeachment", "cpi", "corrupção", "lava jato",
+    "bolsonaro", "lula", "eleição", "eleições",
+    "partido", "deputado federal", "senador",
+    # --- Esporte Genérico (resultado, não evento) ---
+    "placar", "gol de", "campeonato",
+    "seleção brasileira", "copa do mundo",
+    # --- Outros Ruídos ---
+    "receita de", "culinária", "dieta",
+    "horóscopo", "signo", "previsão astral",
+    "obituário", "velório", "enterro",
+    "golpe", "fraude", "pirâmide",
+    "pornografia", "nude",
+]
+
+# ============================================================
+# FILTRO DE LOCALIDADE — Garantir que é notícia do Brasil
+# ============================================================
+# Se o título+resumo contiver essas palavras, é provável que a
+# notícia NÃO seja do Brasil (ex: Lagos = Portugal/Nigéria).
+# Descartada automaticamente.
+FOREIGN_INDICATORS = [
+    "portugal", "lisboa", "porto alegre" if False else "",  # placeholder
+    "nigéria", "nigeria", "africa", "áfrica",
+    "estados unidos", "eua", "usa",
+    "china", "japão", "japan", "taiwan",
+    "índia", "india",
+    "argentina", "colômbia", "colombia",
+    "europa", "ásia", "asia",
+    "hanói", "hanoi", "tóquio", "tokyo",
+    "new york", "london", "londres", "paris", "madrid",
+    "algarve", "faro", "portimão",
+]
+# Limpar strings vazias do placeholder
+FOREIGN_INDICATORS = [x for x in FOREIGN_INDICATORS if x]
+
+# ============================================================
+# DEDUPLICAÇÃO GLOBAL — Evitar a mesma notícia em várias cidades
+# ============================================================
+# Notícias nacionais (ex: "Uber lança recurso em todo Brasil")
+# aparecem repetidas para cada cidade buscada. Ativar deduplicação
+# global por título normalizado elimina essas repetições.
+ENABLE_GLOBAL_DEDUP = True

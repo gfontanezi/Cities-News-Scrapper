@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Cities News Scrapper — Coletor de Notícias Hiper-Locais
-========================================================
-Script Python para varrer o Google News RSS em busca de notícias
-operacionalmente relevantes para 100+ cidades brasileiras.
-
-O output é um JSON estruturado que será consumido pela IA interna
-da 99 para classificação e geração de insights de incentivo.
+Cities News Scrapper v2.0 — Coletor Profissional de Notícias Hiper-Locais
+==========================================================================
+Desenvolvido para o time de Operações da 99.
+Coleta notícias via Google News RSS, aplica filtros em camadas
+(blacklist → localidade → relevância → deduplicação global) e exporta
+um CSV limpo pronto para consumo pela IA corporativa.
 
 Uso:
     python scrapper.py
 """
 
+import csv
 import json
 import os
+import re
 import sys
 import time
 import logging
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
@@ -34,6 +36,9 @@ from config import (
     GOOGLE_NEWS_RSS_URL,
     SEARCH_QUERIES,
     RELEVANCE_KEYWORDS,
+    BLACKLIST_KEYWORDS,
+    FOREIGN_INDICATORS,
+    ENABLE_GLOBAL_DEDUP,
 )
 
 # ============================================================
@@ -48,7 +53,40 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# Funções Auxiliares
+# Funções de Texto e Normalização
+# ============================================================
+
+def normalize_text(text: str) -> str:
+    """Remove acentos e converte para minúsculas para comparação."""
+    nfkd = unicodedata.normalize("NFKD", text)
+    ascii_text = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return ascii_text.lower().strip()
+
+
+def clean_html(raw: str) -> str:
+    """Remove tags HTML e entidades, retornando texto limpo."""
+    clean = re.sub(r"<[^>]+>", "", raw)
+    clean = clean.replace("&nbsp;", " ").replace("&amp;", "&")
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
+
+
+def normalize_title_for_dedup(title: str) -> str:
+    """
+    Normaliza título para deduplicação global.
+    Remove o nome do portal (tudo após o último ' - '), acentos e pontuação.
+    Ex: 'Uber lança recurso no Brasil - G1' → 'uber lanca recurso no brasil'
+    """
+    # Remove sufixo do portal
+    if " - " in title:
+        title = title.rsplit(" - ", 1)[0]
+    # Remove pontuação e normaliza
+    title = re.sub(r"[^\w\s]", "", title)
+    return normalize_text(title)
+
+
+# ============================================================
+# Funções de Carregamento
 # ============================================================
 
 def load_cities(filepath: str) -> list[str]:
@@ -73,229 +111,236 @@ def load_cities(filepath: str) -> list[str]:
     return cities
 
 
+# ============================================================
+# Funções de URL e RSS
+# ============================================================
+
 def build_rss_url(city: str, search_term: str) -> str:
-    """
-    Monta a URL do Google News RSS para uma cidade + termo de busca.
-    Usa aspas ao redor do nome da cidade para busca exata.
-    """
-    # Busca exata: "Nome da Cidade" + termo
+    """Monta a URL do Google News RSS com busca exata por cidade."""
     query = f'"{city}" {search_term}'
     encoded_query = quote(query)
     when = f"{SEARCH_PERIOD_DAYS}d"
-    url = GOOGLE_NEWS_RSS_URL.format(query=encoded_query, when=when)
-    return url
+    return GOOGLE_NEWS_RSS_URL.format(query=encoded_query, when=when)
+
+
+def build_grouped_query(terms: list[str]) -> str:
+    """
+    Agrupa termos de busca com OR, tratando termos compostos e operador site:.
+    Ex: ['Uber', 'aplicativo de transporte', 'motorista site:gov.br']
+    → '(Uber OR "aplicativo de transporte" OR (motorista site:gov.br))'
+    """
+    parts = []
+    for t in terms:
+        if " site:" in t:
+            term_part, site_part = t.split(" site:", 1)
+            site_part = f"site:{site_part}"
+            if " " in term_part:
+                term_part = f'"{term_part}"'
+            parts.append(f"({term_part} {site_part})")
+        elif " " in t:
+            parts.append(f'"{t}"')
+        else:
+            parts.append(t)
+    return f"({' OR '.join(parts)})"
 
 
 def parse_published_date(entry) -> str | None:
-    """
-    Extrai a data de publicação de uma entrada do feed RSS.
-    Retorna string ISO 8601 ou None se não disponível.
-    """
+    """Extrai a data de publicação como ISO 8601."""
     if hasattr(entry, "published_parsed") and entry.published_parsed:
         try:
             dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
             return dt.isoformat()
         except (ValueError, TypeError):
             pass
-
-    # Fallback: tentar o campo 'published' como string
     if hasattr(entry, "published") and entry.published:
         return entry.published
-
     return None
 
 
 def is_within_period(entry, cutoff_date: datetime) -> bool:
-    """
-    Verifica se a notícia está dentro da janela temporal.
-    Se não conseguir determinar a data, inclui a notícia por segurança.
-    """
+    """Verifica se a notícia está dentro da janela temporal."""
     if hasattr(entry, "published_parsed") and entry.published_parsed:
         try:
             dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
             return dt >= cutoff_date
         except (ValueError, TypeError):
             pass
-    # Se não tem data, inclui por segurança (o Google News já filtra por 'when')
     return True
 
 
-def clean_summary(raw_summary: str) -> str:
-    """
-    Limpa o resumo do Google News removendo tags HTML básicas.
-    O feed RSS do Google News retorna resumos com tags <a>, <b>, etc.
-    """
-    import re
-    # Remove tags HTML
-    clean = re.sub(r"<[^>]+>", "", raw_summary)
-    # Remove espaços extras
-    clean = re.sub(r"\s+", " ", clean).strip()
-    return clean
+# ============================================================
+# Pipeline de Filtros (executados em ordem)
+# ============================================================
+
+def is_blacklisted(text: str) -> bool:
+    """FILTRO 1: Rejeita notícias com palavras da blacklist."""
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in BLACKLIST_KEYWORDS)
 
 
-def is_relevant(title: str, summary: str, category: str) -> bool:
-    """
-    Verifica se a notícia é relevante para a categoria.
-    O título ou resumo deve conter ao menos UMA keyword de validação.
-    Se a categoria não tiver keywords definidas, aceita tudo.
-    """
+def is_foreign(text: str) -> bool:
+    """FILTRO 2: Rejeita notícias que parecem ser de outros países."""
+    text_normalized = normalize_text(text)
+    return any(indicator in text_normalized for indicator in
+               [normalize_text(fi) for fi in FOREIGN_INDICATORS])
+
+
+def is_relevant(text: str, category: str) -> bool:
+    """FILTRO 3: Aceita apenas notícias com keywords da categoria."""
     keywords = RELEVANCE_KEYWORDS.get(category)
     if not keywords:
-        return True  # Sem filtro para essa categoria
+        return True
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in keywords)
 
-    text = f"{title} {summary}".lower()
-    return any(kw in text for kw in keywords)
 
-
-def identify_matched_query(title: str, summary: str, terms: list[str]) -> str:
-    """
-    Identifica qual dos termos de busca deu match no título ou resumo.
-    Se não for possível identificar, retorna uma string combinada ou o primeiro termo.
-    """
-    text = f"{title} {summary}".lower()
+def identify_matched_term(text: str, terms: list[str]) -> str:
+    """Identifica qual termo original deu match na notícia."""
+    text_lower = text.lower()
     for term in terms:
-        if term.lower() in text:
-            return term
-    return terms[0] if terms else "Vários"
+        # Limpa o operador site: para comparação
+        clean_term = term.split(" site:")[0] if " site:" in term else term
+        if clean_term.lower() in text_lower:
+            return clean_term
+    return terms[0].split(" site:")[0] if terms else "—"
 
+
+# ============================================================
+# Coleta Principal
+# ============================================================
 
 def fetch_news_for_category(
     city: str,
     category: str,
     terms: list[str],
     seen_links: set,
+    global_titles: set,
     cutoff_date: datetime,
     current_delay: float,
-) -> tuple[list[dict], float, int]:
+) -> tuple[list[dict], float, dict]:
     """
-    Busca notícias para uma categoria agrupando os termos de busca com OR.
-    Retorna a lista de notícias (deduplicadas e filtradas),
-    o delay atualizado e a quantidade de notícias descartadas por irrelevância.
+    Busca notícias para uma cidade+categoria e aplica todos os filtros.
+    Retorna (notícias_aceitas, delay_atualizado, contadores_de_filtro).
     """
-    # Agrupa termos: (termo1 OR termo2 OR termo3)
-    # Termos com mais de uma palavra devem conter aspas no Google News se quisermos busca exata,
-    # mas o Google RSS lida bem com termos simples. Vamos juntá-los com OR.
-    grouped_terms = " OR ".join(f'"{t}"' if " " in t else t for t in terms)
-    query_str = f"({grouped_terms})"
-    
+    query_str = build_grouped_query(terms)
     url = build_rss_url(city, query_str)
+
     news_items = []
-    filtered_count = 0
+    stats = {"blacklisted": 0, "foreign": 0, "irrelevant": 0, "duplicate": 0, "accepted": 0}
 
     try:
         feed = feedparser.parse(url)
 
-        # Verificar se o feed retornou com sucesso
         if feed.bozo and not feed.entries:
-            # Feed com erro e sem entradas → possível bloqueio
             logger.warning(
-                f"  ⚠️  Feed com erro para '{city} + {category}' "
-                f"— aumentando delay para {min(current_delay * BACKOFF_FACTOR, MAX_DELAY):.1f}s"
+                f"  ⚠️  Feed com erro para '{city} / {category}' "
+                f"— backoff para {min(current_delay * BACKOFF_FACTOR, MAX_DELAY):.1f}s"
             )
             current_delay = min(current_delay * BACKOFF_FACTOR, MAX_DELAY)
-            return news_items, current_delay, filtered_count
+            return news_items, current_delay, stats
 
         for entry in feed.entries:
-            # Filtrar por período
             if not is_within_period(entry, cutoff_date):
                 continue
 
             link = entry.get("link", "")
-
-            # Deduplicação por link
             if link in seen_links:
                 continue
             seen_links.add(link)
 
             title = entry.get("title", "Sem título")
-            summary = clean_summary(entry.get("summary", ""))
+            summary = clean_html(entry.get("summary", ""))
+            full_text = f"{title} {summary}"
 
-            # Filtro de relevância: verificar se a notícia é de fato sobre o tema
-            if not is_relevant(title, summary, category):
-                filtered_count += 1
-                logger.debug(
-                    f"    🚫 Descartada (irrelevante): {title[:80]}..."
-                )
+            # --- FILTRO 1: Blacklist ---
+            if is_blacklisted(full_text):
+                stats["blacklisted"] += 1
                 continue
 
-            # Identifica qual termo exato da lista deu match
-            matched_term = identify_matched_query(title, summary, terms)
+            # --- FILTRO 2: Notícia estrangeira ---
+            if is_foreign(full_text):
+                stats["foreign"] += 1
+                continue
 
-            # Extrair e estruturar a notícia
-            news_item = {
-                "titulo": title,
+            # --- FILTRO 3: Relevância para a categoria ---
+            if not is_relevant(full_text, category):
+                stats["irrelevant"] += 1
+                continue
+
+            # --- FILTRO 4: Deduplicação global por título ---
+            if ENABLE_GLOBAL_DEDUP:
+                norm_title = normalize_title_for_dedup(title)
+                if norm_title in global_titles:
+                    stats["duplicate"] += 1
+                    continue
+                global_titles.add(norm_title)
+
+            # --- ACEITA: Notícia passou em todos os filtros ---
+            matched = identify_matched_term(full_text, terms)
+
+            # Limpa o nome do portal do título para o CSV
+            clean_title = title.rsplit(" - ", 1)[0] if " - " in title else title
+
+            news_items.append({
+                "titulo": clean_title,
+                "fonte": title.rsplit(" - ", 1)[1].strip() if " - " in title else "—",
                 "link": link,
                 "resumo_google": summary,
                 "categoria": category,
-                "query": matched_term,
+                "query": matched,
                 "data_publicacao": parse_published_date(entry),
-            }
-            news_items.append(news_item)
+            })
+            stats["accepted"] += 1
 
-        # Sucesso → recuperar delay gradualmente
+        # Recovery de delay
         if current_delay > BASE_DELAY:
             new_delay = max(current_delay * RECOVERY_FACTOR, BASE_DELAY)
             if new_delay < current_delay:
-                logger.info(f"  ✅ Sucesso — reduzindo delay para {new_delay:.1f}s")
+                logger.info(f"  ✅ Recovery — delay reduzido para {new_delay:.1f}s")
             current_delay = new_delay
 
     except Exception as e:
-        logger.error(f"  ❌ Erro ao buscar '{city} + {category}': {e}")
+        logger.error(f"  ❌ Erro ao buscar '{city} / {category}': {e}")
         current_delay = min(current_delay * BACKOFF_FACTOR, MAX_DELAY)
-        logger.warning(f"  ⚠️  Aumentando delay para {current_delay:.1f}s")
 
-    return news_items, current_delay, filtered_count
+    return news_items, current_delay, stats
 
 
-import csv
+# ============================================================
+# Exportação CSV
+# ============================================================
 
 def save_results(results: list[dict], output_dir: str) -> str:
-    """
-    Salva os resultados em um arquivo CSV (flat table).
-    Cada linha representa uma notícia com seus respectivos metadados.
-    Usa 'utf-8-sig' para compatibilidade nativa com o Excel do Windows.
-    """
+    """Salva resultados em CSV com codificação UTF-8-SIG (compatível Excel/IA)."""
     os.makedirs(output_dir, exist_ok=True)
 
     today = datetime.now().strftime("%Y-%m-%d")
-    filename = f"relatorio_{today}.csv"
-    filepath = os.path.join(output_dir, filename)
+    filepath = os.path.join(output_dir, f"relatorio_{today}.csv")
 
-    # Campos que serão salvos na planilha
     headers = [
-        "cidade",
-        "categoria",
-        "query_termo",
-        "titulo",
-        "link",
-        "resumo_google",
-        "data_publicacao"
+        "cidade", "categoria", "query_termo", "titulo",
+        "fonte", "link", "resumo_google", "data_publicacao",
     ]
 
-    try:
-        # utf-8-sig adiciona o BOM no início do arquivo, forçando o Excel a ler acentos corretamente
-        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=headers, delimiter=",")
-            writer.writeheader()
+    with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=headers, delimiter=",")
+        writer.writeheader()
 
-            for city_data in results:
-                cidade = city_data.get("cidade", "")
-                for news in city_data.get("noticias", []):
-                    writer.writerow({
-                        "cidade": cidade,
-                        "categoria": news.get("categoria", ""),
-                        "query_termo": news.get("query", ""),
-                        "titulo": news.get("titulo", ""),
-                        "link": news.get("link", ""),
-                        "resumo_google": news.get("resumo_google", ""),
-                        "data_publicacao": news.get("data_publicacao", "")
-                    })
-
-    except Exception as e:
-        logger.error(f"❌ Erro ao salvar arquivo CSV: {e}")
+        for city_data in results:
+            cidade = city_data["cidade"]
+            for news in city_data["noticias"]:
+                writer.writerow({
+                    "cidade": cidade,
+                    "categoria": news["categoria"],
+                    "query_termo": news["query"],
+                    "titulo": news["titulo"],
+                    "fonte": news["fonte"],
+                    "link": news["link"],
+                    "resumo_google": news["resumo_google"],
+                    "data_publicacao": news["data_publicacao"] or "",
+                })
 
     return filepath
-
 
 
 # ============================================================
@@ -303,106 +348,95 @@ def save_results(results: list[dict], output_dir: str) -> str:
 # ============================================================
 
 def main():
-    """Executa o coletor de notícias para todas as cidades."""
-    logger.info("=" * 60)
-    logger.info("🚀 Cities News Scrapper — Iniciando coleta")
-    logger.info("=" * 60)
+    logger.info("=" * 65)
+    logger.info("🚀 Cities News Scrapper v2.0 — Coleta Profissional")
+    logger.info("=" * 65)
 
-    # Carregar cidades
     cities = load_cities(CITIES_FILE)
 
-    # Calcular data de corte
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=SEARCH_PERIOD_DAYS)
-    logger.info(f"📅 Buscando notícias dos últimos {SEARCH_PERIOD_DAYS} dias (desde {cutoff_date.strftime('%d/%m/%Y')})")
+    logger.info(f"📅 Período: últimos {SEARCH_PERIOD_DAYS} dias (desde {cutoff_date.strftime('%d/%m/%Y')})")
 
-    # Contabilizar total de queries (agora 1 por categoria por cidade)
     total_categories = len(SEARCH_QUERIES)
     total_queries = len(cities) * total_categories
-    logger.info(f"🔍 Total de buscas a realizar (agrupadas por OR): {len(cities)} cidades × {total_categories} categorias = {total_queries} queries\n")
+    logger.info(f"🔍 Queries planejadas: {len(cities)} cidades × {total_categories} categorias = {total_queries}")
+    logger.info(f"🛡️  Filtros ativos: Blacklist → Localidade → Relevância → Dedup Global\n")
 
-    # Estado
+    # Estado global
     current_delay = BASE_DELAY
+    global_titles = set()  # Deduplicação global por título
     results = []
-    total_news = 0
-    total_filtered = 0
+
+    # Contadores globais
+    totals = {"accepted": 0, "blacklisted": 0, "foreign": 0, "irrelevant": 0, "duplicate": 0}
     cities_with_news = 0
-    query_count = 0
 
     start_time = time.time()
 
-    for city_index, city in enumerate(cities, 1):
-        logger.info(f"🏙️  [{city_index}/{len(cities)}] Processando: {city}")
+    for idx, city in enumerate(cities, 1):
+        logger.info(f"🏙️  [{idx}/{len(cities)}] {city}")
 
         city_news = []
-        city_filtered = 0
-        seen_links = set()  # Deduplicação por cidade
+        seen_links = set()
 
         for category, terms in SEARCH_QUERIES.items():
-            query_count += 1
-
-            # Buscar notícias agrupadas por categoria
-            news_items, current_delay, filtered = fetch_news_for_category(
+            news_items, current_delay, stats = fetch_news_for_category(
                 city=city,
                 category=category,
                 terms=terms,
                 seen_links=seen_links,
+                global_titles=global_titles,
                 cutoff_date=cutoff_date,
                 current_delay=current_delay,
             )
 
-            city_filtered += filtered
+            # Acumular contadores
+            for k in totals:
+                totals[k] += stats.get(k, 0)
 
             if news_items:
                 city_news.extend(news_items)
+                filtered_total = stats["blacklisted"] + stats["foreign"] + stats["irrelevant"] + stats["duplicate"]
                 logger.info(
-                    f"    📰 Categoria '{category}': {len(news_items)} relevante(s)"
-                    + (f", {filtered} descartada(s)" if filtered else "")
-                )
-            elif filtered:
-                logger.info(
-                    f"    🚫 Categoria '{category}': {filtered} descartada(s) por irrelevância"
+                    f"    📰 {category}: {len(news_items)} aceita(s)"
+                    + (f" | {filtered_total} filtrada(s)" if filtered_total else "")
                 )
 
-            # Delay entre requisições
             time.sleep(current_delay)
 
-        # Montar resultado da cidade
-        city_result = {
+        results.append({
             "cidade": city,
             "total_noticias": len(city_news),
             "noticias": city_news,
-        }
-        results.append(city_result)
-        total_filtered += city_filtered
+        })
 
         if city_news:
             cities_with_news += 1
-            total_news += len(city_news)
-            logger.info(
-                f"    ✅ Total para {city}: {len(city_news)} notícia(s)"
-                + (f" ({city_filtered} descartada(s))" if city_filtered else "")
-                + "\n"
-            )
+            logger.info(f"    ✅ Total: {len(city_news)} notícia(s) relevante(s)\n")
         else:
-            logger.info(f"    ⚪ Nenhuma notícia relevante para {city}\n")
+            logger.info(f"    ⚪ Sem notícias relevantes\n")
 
-    # Salvar resultados
+    # Salvar
     filepath = save_results(results, OUTPUT_DIR)
     elapsed = time.time() - start_time
 
-    # Resumo final
-    logger.info("=" * 60)
-    logger.info("📊 RESUMO DA COLETA")
-    logger.info("=" * 60)
-    logger.info(f"  🏙️  Cidades processadas: {len(cities)}")
-    logger.info(f"  🔍 Queries realizadas:   {query_count}")
-    logger.info(f"  📰 Notícias relevantes:  {total_news}")
-    logger.info(f"  🚫 Notícias descartadas: {total_filtered}")
-    logger.info(f"  ✅ Cidades com notícias: {cities_with_news}")
-    logger.info(f"  ⚪ Cidades sem notícias: {len(cities) - cities_with_news}")
-    logger.info(f"  ⏱️  Tempo total:          {elapsed:.1f} segundos")
-    logger.info(f"  💾 Relatório salvo em:   {filepath}")
-    logger.info("=" * 60)
+    # Resumo
+    total_filtered = totals["blacklisted"] + totals["foreign"] + totals["irrelevant"] + totals["duplicate"]
+
+    logger.info("=" * 65)
+    logger.info("📊 RESUMO DA COLETA v2.0")
+    logger.info("=" * 65)
+    logger.info(f"  🏙️  Cidades processadas:    {len(cities)}")
+    logger.info(f"  ✅ Cidades com notícias:    {cities_with_news}")
+    logger.info(f"  📰 Notícias ACEITAS:        {totals['accepted']}")
+    logger.info(f"  🚫 Total filtradas:         {total_filtered}")
+    logger.info(f"      ├─ Blacklist (crime):   {totals['blacklisted']}")
+    logger.info(f"      ├─ Estrangeiras:        {totals['foreign']}")
+    logger.info(f"      ├─ Irrelevantes:        {totals['irrelevant']}")
+    logger.info(f"      └─ Duplicadas (global): {totals['duplicate']}")
+    logger.info(f"  ⏱️  Tempo total:             {elapsed:.1f}s")
+    logger.info(f"  💾 Relatório:               {filepath}")
+    logger.info("=" * 65)
 
 
 if __name__ == "__main__":
